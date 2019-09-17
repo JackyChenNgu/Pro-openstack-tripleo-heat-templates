@@ -1,0 +1,37 @@
+heat_template_version: rocky
+
+description: >
+  OpenStack containerized Heat API service
+
+outputs:
+  config_settings:
+    description: Extra hieradata needed to log to files in the host.
+    value: null
+  docker_config:
+    description: Extra containers needed for logging to files in the host.
+    value:
+      step_2: {}
+  volumes:
+    description: The volumes needed to log to files in the host.
+    value:
+      - /var/log/containers/heat:/var/log/heat
+      - /var/log/containers/httpd/heat-api:/var/log/httpd
+  host_prep_tasks:
+    description: Extra ansible tasks needed for logging to files in the host.
+    value:
+      - name: create persistent directories
+        file:
+          path: "{{ item.path }}"
+          state: directory
+          setype: "{{ item.setype }}"
+        with_items:
+          - { 'path': /var/log/containers/heat, 'setype': svirt_sandbox_file_t }
+          - { 'path': /var/log/containers/httpd/heat-api, 'setype': svirt_sandbox_file_t }
+          - { 'path': /var/log/heat, 'setype': svirt_sandbox_file_t }
+      - name: heat logs readme
+        copy:
+          dest: /var/log/heat/readme.txt
+          content: |
+            Log files from heat containers can be found under
+            /var/log/containers/heat and /var/log/containers/httpd/heat-api*.
+        ignore_errors: true

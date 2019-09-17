@@ -1,0 +1,106 @@
+heat_template_version: rocky
+
+description: >
+  Open vSwitch Configuration
+
+parameters:
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  OvsDpdkCoreList:
+    description: >
+      List of cores to be used for DPDK lcore threads.  Note, these threads
+      are used by the OVS control path for validator and handling functions.
+    type: string
+    constraints:
+      - allowed_pattern: "[0-9,-]*"
+    default: ""
+    tags:
+      - role_specific
+  OvsDpdkMemoryChannels:
+    description: Number of memory channels per socket to be used for DPDK
+    type: string
+    constraints:
+      - allowed_pattern: "[0-9]*"
+    default: "4"
+    tags:
+      - role_specific
+  OvsDpdkSocketMemory:
+    default: ""
+    description: >
+      Sets the amount of hugepage memory to assign per NUMA node. It is
+      recommended to use the socket closest to the PCIe slot used for the
+      desired DPDK NIC.  The format should be in "<socket 0 mem>, <socket 1
+      mem>, <socket n mem>", where the value is specified in MB.  For example:
+      "1024,0".
+    type: string
+    tags:
+      - role_specific
+  OvsDpdkDriverType:
+    default: "vfio-pci"
+    description: >
+      DPDK Driver type. Ensure the Overcloud NIC to be used for DPDK supports
+      this UIO/PMD driver.
+    type: string
+    tags:
+      - role_specific
+  OvsPmdCoreList:
+    description: >
+      A list or range of CPU cores for PMD threads to be pinned to.  Note, NIC
+      location to cores on socket, number of hyper-threaded logical cores, and
+      desired number of PMD threads can all play a role in configuring this
+      setting.  These cores should be on the same socket where
+      OvsDpdkSocketMemory is assigned.  If using hyperthreading then specify
+      both logical cores that would equal the physical core. Also, specifying
+      more than one core will trigger multiple PMD threads to be spawned which
+      may improve dataplane performance.
+    constraints:
+      - allowed_pattern: "[0-9,-]*"
+    type: string
+    default: ""
+    tags:
+      - role_specific
+
+outputs:
+  role_data:
+    description: Role data for the Open vSwitch service.
+    value:
+      service_name: openvswitch
+      config_settings:
+        map_replace:
+          - map_replace:
+            - vswitch::dpdk::driver_type: OvsDpdkDriverType
+              vswitch::dpdk::host_core_list: OvsDpdkCoreList
+              vswitch::dpdk::pmd_core_list: OvsPmdCoreList
+              vswitch::dpdk::memory_channels: OvsDpdkMemoryChannels
+              vswitch::dpdk::socket_mem: OvsDpdkSocketMemory
+            - values: {get_param: [RoleParameters]}
+          - values:
+              OvsDpdkCoreList: {get_param: OvsDpdkCoreList}
+              OvsDpdkMemoryChannels: {get_param: OvsDpdkMemoryChannels}
+              OvsDpdkSocketMemory: {get_param: OvsDpdkSocketMemory}
+              OvsDpdkDriverType: {get_param: OvsDpdkDriverType}
+              OvsPmdCoreList: {get_param: OvsPmdCoreList}

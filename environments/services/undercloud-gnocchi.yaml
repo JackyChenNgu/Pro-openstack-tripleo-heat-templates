@@ -1,0 +1,7 @@
+# DEPRECATED. This file will be removed in the Stein release as it is no longer
+# needed
+resource_registry:
+  OS::TripleO::Services::GnocchiApi: ../../docker/services/gnocchi-api.yaml
+  OS::TripleO::Services::GnocchiMetricd: ../../docker/services/gnocchi-metricd.yaml
+  OS::TripleO::Services::GnocchiStatsd: ../../docker/services/gnocchi-statsd.yaml
+  OS::TripleO::Services::Redis: ../../docker/services/database/redis.yaml

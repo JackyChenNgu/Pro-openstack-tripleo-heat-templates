@@ -1,0 +1,155 @@
+resource_registry:
+  OS::TripleO::Services::Tmpwatch: ../extraconfig/services/tmpwatch-install.yaml
+  OS::TripleO::Network::Ports::RedisVipPort: ../network/ports/noop.yaml
+  OS::TripleO::Network::Ports::ControlPlaneVipPort: ../deployed-server/deployed-neutron-port.yaml
+  OS::TripleO::Undercloud::Net::SoftwareConfig: ../net-config-undercloud.yaml
+  OS::TripleO::NodeExtraConfig: ../extraconfig/pre_deploy/undercloud_pre.yaml
+  OS::TripleO::NodeExtraConfigPost: ../extraconfig/post_deploy/undercloud_post.yaml
+  OS::TripleO::Services::DockerRegistry: ../puppet/services/docker-registry.yaml
+  OS::TripleO::Services::ContainerImagePrepare: ../puppet/services/container-image-prepare.yaml
+  # Allows us to control the external VIP for Undercloud SSL
+  OS::TripleO::Network::Ports::ExternalVipPort: ../network/ports/external_from_pool.yaml
+
+  # We managed this in instack-undercloud, so we need to manage it here.
+  OS::TripleO::Services::SELinux: ../puppet/services/selinux.yaml
+  OS::TripleO::Services::OpenStackClients: ../puppet/services/openstack-clients.yaml
+
+  # services we disable by default on the undercloud
+  OS::TripleO::Services::AodhApi: OS::Heat::None
+  OS::TripleO::Services::AodhEvaluator: OS::Heat::None
+  OS::TripleO::Services::AodhNotifier: OS::Heat::None
+  OS::TripleO::Services::AodhListener: OS::Heat::None
+  OS::TripleO::Services::CeilometerAgentCentral: OS::Heat::None
+  OS::TripleO::Services::CeilometerAgentNotification: OS::Heat::None
+  OS::TripleO::Services::CeilometerAgentIpmi: OS::Heat::None
+  OS::TripleO::Services::GnocchiApi: OS::Heat::None
+  OS::TripleO::Services::GnocchiMetricd: OS::Heat::None
+  OS::TripleO::Services::GnocchiStatsd: OS::Heat::None
+  OS::TripleO::Services::PankoApi: OS::Heat::None
+  OS::TripleO::Services::Redis: OS::Heat::None
+  OS::TripleO::Services::CinderApi: OS::Heat::None
+  OS::TripleO::Services::CinderScheduler: OS::Heat::None
+  OS::TripleO::Services::CinderVolume: OS::Heat::None
+
+  # Undercloud HA services
+  OS::TripleO::Services::HAproxy: OS::Heat::None
+  OS::TripleO::Services::Keepalived: OS::Heat::None
+
+parameter_defaults:
+  # ensure we enable ip_forward before docker gets run
+  KernelIpForward: 1
+  KernelIpNonLocalBind: 1
+  KeystoneCorsAllowedOrigin: '*'
+  KeystoneEnableMember: true
+  # Increase the Token expiration time until we fix the actual session bug:
+  # https://bugs.launchpad.net/tripleo/+bug/1761050
+  TokenExpiration: 14400
+  EnablePackageInstall: true
+  StackAction: CREATE
+  SoftwareConfigTransport: POLL_SERVER_HEAT
+  NeutronTunnelTypes: []
+  NeutronBridgeMappings: ctlplane:br-ctlplane
+  NeutronAgentExtensions: []
+  NeutronFlatNetworks: '*'
+  NovaSchedulerAvailableFilters: 'tripleo_common.filters.list.tripleo_filters'
+  NovaSchedulerDefaultFilters: ['RetryFilter', 'TripleOCapabilitiesFilter', 'ComputeCapabilitiesFilter', 'AvailabilityZoneFilter', 'ComputeFilter', 'ImagePropertiesFilter', 'ServerGroupAntiAffinityFilter', 'ServerGroupAffinityFilter']
+  NovaSchedulerMaxAttempts: 30
+  # Disable compute auto disabling:
+  # As part of Pike, nova introduced a change to have the nova-compute
+  # process automatically disable the nova-compute instance in the case of
+  # consecutive build failures. This can lead to odd errors when deploying
+  # the ironic nodes on the undercloud as you end up with a ComputeFilter
+  # error. This parameter disables this functionality for the undercloud since
+  # we do not want the nova-compute instance running on the undercloud for
+  # Ironic to be disabled in the case of multiple deployment failures.
+  NovaAutoDisabling: '0'
+  NovaCorsAllowedOrigin: '*'
+  NovaSyncPowerStateInterval: -1
+  NeutronDhcpAgentsPerNetwork: 2
+  HeatConvergenceEngine: true
+  HeatCorsAllowedOrigin: '*'
+  HeatMaxNestedStackDepth: 7
+  HeatMaxResourcesPerStack: -1
+  HeatMaxJsonBodySize: 4194304
+  HeatReauthenticationAuthMethod: 'trusts'
+  HeatYaqlLimitIterators: 10000
+  IronicCleaningDiskErase: 'metadata'
+  IronicCorsAllowedOrigin: '*'
+  IronicDefaultInspectInterface: 'inspector'
+  IronicDefaultResourceClass: 'baremetal'
+  IronicEnabledHardwareTypes: ['ipmi', 'redfish', 'idrac', 'ilo']
+  IronicEnabledBootInterfaces: ['pxe', 'ilo-pxe']
+  IronicEnabledConsoleInterfaces: ['ipmitool-socat', 'ilo', 'no-console']
+  IronicEnabledDeployInterfaces: ['iscsi', 'direct', 'ansible']
+  IronicEnabledInspectInterfaces: ['inspector', 'no-inspect']
+  IronicEnabledManagementInterfaces: ['ipmitool', 'redfish', 'idrac', 'ilo']
+  # NOTE(dtantsur): disabling advanced networking as it's not used (or
+  # configured) in the undercloud
+  IronicEnabledNetworkInterfaces: ['flat']
+  IronicEnabledPowerInterfaces: ['ipmitool', 'redfish', 'idrac', 'ilo']
+  # NOTE(dtantsur): disabling the "agent" RAID as our ramdisk does not contain
+  # any vendor-specific RAID additions.
+  IronicEnabledRaidInterfaces: ['no-raid']
+  # NOTE(dtantsur): we don't use boot-from-cinder on the undercloud
+  IronicEnabledStorageInterfaces: ['noop']
+  IronicEnabledVendorInterfaces: ['ipmitool', 'idrac', 'no-vendor']
+  IronicEnableStagingDrivers: true
+  IronicCleaningNetwork: 'ctlplane'
+  IronicForcePowerStateDuringSync: false
+  IronicInspectorCollectors: default,extra-hardware,numa-topology,logs
+  IronicInspectorInterface: br-ctlplane
+  IronicInspectorSubnets:
+    - ip_range: '192.168.24.100,192.168.24.200'
+  IronicProvisioningNetwork: 'ctlplane'
+  IronicRescuingNetwork: 'ctlplane'
+  ZaqarMessageStore: 'swift'
+  ZaqarManagementStore: 'sqlalchemy'
+  MistralCorsAllowedOrigin: '*'
+  MistralExecutionFieldSizeLimit: 16384
+  MistralExecutorVolumes:
+    - /var/lib/config-data/nova/etc/nova:/etc/nova:ro
+  NeutronServicePlugins: router,segments
+  NeutronMechanismDrivers: ['openvswitch', 'baremetal']
+  NeutronNetworkVLANRanges: 'physnet1:1000:2999'
+  NeutronPluginExtensions: 'port_security'
+  NeutronFirewallDriver: ''
+  NeutronNetworkType: ['local','flat','vlan','gre','vxlan']
+  NeutronTunnelIdRanges: '20:100'
+  NeutronTypeDrivers: ['local','flat','vlan','gre','vxlan']
+  NeutronVniRanges: '10:100'
+  NeutronPortQuota: '-1'
+  SwiftCorsAllowedOrigin: '*'
+  SwiftReplicas: 1
+  SwiftWorkers: 2
+  SwiftAccountWorkers: 2
+  SwiftContainerWorkers: 2
+  SwiftObjectWorkers: 2
+  # A list of static routes for the control plane network. Ensure traffic to
+  # nodes on remote control plane networks use the correct network path.
+  # Example:
+  #   ControlPlaneStaticRoutes:
+  #     - ip_netmask: 192.168.25.0/24
+  #       next_hop: 192.168.24.1
+  #     - ip_netmask: 192.168.26.0/24
+  #       next_hop: 192.168.24.1
+  ControlPlaneStaticRoutes: []
+  UndercloudCtlplaneSubnets:
+    ctlplane-subnet:
+      NetworkCidr: '192.168.24.0/24'
+      NetworkGateway: '192.168.24.1'
+      DhcpRangeStart: '192.168.24.5'
+      DhcpRangeEnd: '192.168.24.24'
+  UndercloudCtlplaneLocalSubnet: 'ctlplane-subnet'
+  MistralDockerGroup: true
+  PasswordAuthentication: 'yes'
+  ContainerImagePrepareLogFile: ../install-undercloud.log
+  HeatEngineOptVolumes:
+    - /usr/lib/heat:/usr/lib/heat:ro
+  MySQLServerOptions:
+    mysqld:
+      connect_timeout: 60
+  MistralExecutorExtraVolumes:
+    - /usr/share/ceph-ansible:/usr/share/ceph-ansible:ro
+    - /usr/share/openstack-octavia-amphora-images:/usr/share/openstack-octavia-amphora-images:ro
+  NeutronMetadataProxySharedSecret: ''
+  MetadataNATRule: true

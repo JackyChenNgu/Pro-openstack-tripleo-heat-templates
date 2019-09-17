@@ -1,0 +1,166 @@
+heat_template_version: rocky
+
+description: >
+  OpenStack containerized Nova Metadata service
+
+parameters:
+  DockerNovaMetadataImage:
+    description: image
+    type: string
+  DockerNovaMetadataConfigImage:
+    description: The container image to use for the nova config_volume
+    type: string
+  NovaMetadataLoggingSource:
+    type: json
+    default:
+      tag: openstack.nova.api.metadata
+      path: /var/log/containers/nova/nova-api-metadata.log
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EnableInternalTLS:
+    type: boolean
+    default: false
+  MetadataNATRule:
+    default: false
+    description: When true we create the NAT rule for the metadata service
+    type: boolean
+
+conditions:
+  internal_tls_enabled: {equals: [{get_param: EnableInternalTLS}, true]}
+  need_metadata_nat_rule: {equals: [{get_param: MetadataNATRule}, true]}
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  MySQLClient:
+    type: ../../puppet/services/database/mysql-client.yaml
+
+  NovaMetadataBase:
+    type: ../../puppet/services/nova-metadata.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  NovaMetadataLogging:
+    type: OS::TripleO::Services::Logging::NovaMetadata
+
+outputs:
+  role_data:
+    description: Role data for the Nova Metadata service.
+    value:
+      service_name: {get_attr: [NovaMetadataBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [NovaMetadataBase, role_data, config_settings]
+          - get_attr: [NovaMetadataLogging, config_settings]
+          - apache::default_vhost: false
+          - tripleo.nova_metadata.firewall_rules:
+              if:
+              - need_metadata_nat_rule
+              - '144 undercloud metadata nat':
+                  dport: 80
+                  proto: 'tcp'
+                  table: 'nat'
+                  chain: 'PREROUTING'
+                  jump: 'REDIRECT'
+                  iniface: 'br-ctlplane'
+                  destination: '169.254.169.254/32'
+                  extras:
+                    toports: 8775
+              - {}
+      logging_source: {get_attr: [NovaMetadataBase, role_data, logging_source]}
+      logging_groups: {get_attr: [NovaMetadataBase, role_data, logging_groups]}
+      service_config_settings:
+        map_merge:
+          - get_attr: [NovaMetadataBase, role_data, service_config_settings]
+          - fluentd:
+              tripleo_fluentd_groups_nova_metadata:
+                - nova
+              tripleo_fluentd_sources_nova_metadata:
+                - {get_param: NovaMetadataLoggingSource}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: nova_metadata
+        puppet_tags: nova_config
+        step_config:
+          list_join:
+            - "\n"
+            - - {get_attr: [NovaMetadataBase, role_data, step_config]}
+              - {get_attr: [MySQLClient, role_data, step_config]}
+        config_image: {get_param: DockerNovaMetadataConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/nova_metadata.json:
+          command: /usr/sbin/httpd -DFOREGROUND
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/nova
+              owner: nova:nova
+              recurse: true
+      docker_config:
+        step_2:
+          get_attr: [NovaMetadataLogging, docker_config, step_2]
+        step_4:
+          nova_metadata:
+            start_order: 2
+            image: {get_param: DockerNovaMetadataImage}
+            net: host
+            user: root
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                - {get_attr: [NovaMetadataLogging, volumes]}
+                -
+                  - /var/lib/kolla/config_files/nova_metadata.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/nova_metadata/:/var/lib/kolla/config_files/src:ro
+                  -
+                    if:
+                      - internal_tls_enabled
+                      - /etc/pki/tls/certs/httpd:/etc/pki/tls/certs/httpd:ro
+                      - ''
+                  -
+                    if:
+                      - internal_tls_enabled
+                      - /etc/pki/tls/private/httpd:/etc/pki/tls/private/httpd:ro
+                      - ''
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      metadata_settings:
+        get_attr: [NovaMetadataBase, role_data, metadata_settings]
+      host_prep_tasks: {get_attr: [NovaMetadataLogging, host_prep_tasks]}

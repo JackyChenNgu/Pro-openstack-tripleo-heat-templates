@@ -1,0 +1,354 @@
+heat_template_version: rocky
+
+description: >
+  TripleO Package installation settings
+
+parameters:
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  EnablePackageInstall:
+    default: 'false'
+    description: Set to true to enable package installation at deploy time
+    type: boolean
+  FastForwardRepoType:
+    default: 'tripleo-repos'
+    type: string
+    constraints:
+      - allowed_values: ['tripleo-repos', 'custom-script']
+  FastForwardRepoArgs:
+    default: {'tripleo_repos': {'ocata': '-b ocata current', 'pike': '-b pike current', 'queens': '-b queens current'}}
+    type: json
+  FastForwardCustomRepoScriptContent:
+    default: |
+      #!/bin/bash
+      set -e
+      echo "If you use FastForwardRepoType 'custom-script' you have to provide the upgrade repo script content."
+      echo "It will be installed as /root/ffu_upgrade_repo.sh on the node"
+      echo "and passed the upstream name (ocata, pike, queens) of the release as first argument"
+      exit 1
+    type: string
+  UpgradeInitCommand:
+    type: string
+    description: |
+      Command or script snippet to run on all overcloud nodes to
+      initialize the upgrade process. E.g. a repository switch.
+    default: ''
+  UpgradeInitCommonCommand:
+    type: string
+    description: |
+      Common commands required by the upgrades process. This should not
+      normally be modified by the operator and is set and unset in the
+      major-upgrade-composable-steps.yaml and major-upgrade-converge.yaml
+      environment files.
+    default: ''
+
+outputs:
+  role_data:
+    description: Role data for the TripleO package settings
+    value:
+      service_name: tripleo_packages
+      config_settings:
+        tripleo::packages::enable_install: {get_param: EnablePackageInstall}
+      step_config: |
+        include ::tripleo::packages
+      upgrade_tasks:
+        - name: Package and repo update tasks
+          when: step|int == 0
+          block:
+            - name: Run UpgradeInitCommand
+              shell:
+                list_join:
+                  - ''
+                  - - "#!/bin/bash\n\n"
+                    - "if [[ -f /etc/resolv.conf.save ]] ; then rm /etc/resolv.conf.save; fi\n\n"
+                    - {get_param: UpgradeInitCommand}
+            - name: Run UpgradeInitCommonCommand
+              shell:
+                list_join:
+                  - ''
+                  - - "#!/bin/bash\n\n"
+                    - {get_param: UpgradeInitCommonCommand}
+            - name: Check yum for rpm-python present
+              package: "name=rpm-python state=present"
+              register: rpm_python_check
+            - name: Fail when rpm-python wasn't present
+              fail: msg="rpm-python package was not present before this run! Check environment before re-running"
+              when:
+                - rpm_python_check.changed != false
+        # With the layered product packaging, the key package is rhosp-openvswitch. It depends on
+        # a openvswitch package that includes the version as part of the name (e.g openvswitch2.10).
+        # This requires some additional special handling:
+        #   - During an upgrade the package name for openvswitch may change so
+        #     upgrading the currently installed package won't do anything.
+        #   - The rhosp-openvswitch package "obsoletes" several packages,
+        #     including older openvswitch packages. This results in a pretty
+        #     severe uninstall/install sequence of operations that stops and
+        #     removes openvswitch which could break network links required to
+        #     continue the upgrade.
+        #   - To prevent rhosp-openvswitch breaking connectivity, the currently
+        #     installed core openvswitch packages need to be erased from the rpm
+        #     database but leave the binaries intact. This effectively
+        #     short-circuits the obsoletes mechanism in rhosp-openvswitch and
+        #     leaves the core elements of openvswitch running. In the future we
+        #     may replace this mechanism with "an upgrade on reboot".  We only
+        #     do this for the core openvswitch packages so other packages
+        #     obsoleted by rhosp-openvswitch will be removed when
+        #     rhosp-openvswitch is installed/upgraded.
+        #   - Neither the rhosp-openvswitch nor openvswitch{m.n} package enables
+        #     or starts the systemd service so there must always be a task
+        #     to ensure that it is enabled or OpenvSwitch functionality won't be
+        #     available on reboot.
+        #   - With LP, we expect that the core openvswitch package name will
+        #     change with every major upgrade so this special handling will
+        #     eventually replace the special handling of upgrading the
+        #     openvswitch package "in place"
+        - name: Block for gathering information for upgrading OpenvSwitch layered product packaging
+          when: step|int == 2
+          block:
+            - name: Process rhosp-openvswitch layered package for new version number
+              shell: |
+                set -o pipefail
+                yum info -q rhosp-openvswitch | awk '/^Version/{print $NF}'
+              register: rhosp_package_result
+              ignore_errors: true
+            - name: Set fact for triggering OpenvSwitch layered product package handling
+              set_fact:
+                ovs_lp_packaging: "{{ rhosp_package_result.rc == 0 }}"
+            - name: Capture the expected OpenvSwitch version.
+              set_fact:
+                new_ovs_version: "{{ rhosp_package_result.stdout }}"
+              when: ovs_lp_packaging|default(false)
+
+            - name: Get current OpenvSwitch package name
+              register: ovs_pkg_out
+              shell:
+                rpm -qa | awk -F- '/^(openvswitch[0-9]+\.[0-9]+-|openvswitch-2)/{print $1}'
+            - name: Get version from current OpenvSwitch package
+              register: ovs_version_out
+              shell:
+                rpm -qi  "{{ ovs_pkg_out.stdout }}" | awk '/^Version/{print $NF}'
+            - name: split numeric version for OpenvSwitch into parts
+              set_fact:
+                ovs_version_parts: "{{ ovs_version_out.stdout.split('.') }}"
+            - name: get major minor version for OpenvSwitch package naming
+              set_fact:
+                current_ovs_version: "{{ ovs_version_parts[0] }}.{{ ovs_version_parts[1] }}"
+            - name: get OpenvSwitch major version
+              set_fact:
+                current_ovs_major_version: "{{ ovs_version_parts[0]|int }}"
+            - name: get OpenvSwitch minor version
+              set_fact:
+                current_ovs_minor_version: "{{ ovs_version_parts[1]|int }}"
+        - name: Block for upgrading OpenvSwitch when layer package is present
+          when:
+            - step|int == 2
+            - ovs_lp_packaging|default(false)
+          block:
+            - name: set current OpenvSwitch package suffix if old version is layered product format
+              set_fact:
+                package_suffix: "{{ current_ovs_version }}"
+              when:
+                - current_ovs_major_version|int >= 3 or current_ovs_minor_version|int >=10
+            - name: remove old OpenvSwitch package(s) if version doesn't match
+              shell: |
+                rpm -e --noscripts --nopreun --nopostun --notriggers --nodeps $(rpm -qa 'openvswitch{{ package_suffix|default('') }}*' | grep -v 'selinux')
+              warn: false
+              when: new_ovs_version != current_ovs_version
+            - name: install/upgrade OpenvSwitch LP package
+              package:
+                name: rhosp-openvswitch
+                state: latest
+            - name: set flag to skip other upgrade steps since OpenvSwitch is already upgraded!
+              set_fact:
+                run_ovs_update: false
+        - name: Check for openvswitch upgrade if not layered package installs
+          when:
+            - step|int == 2
+            - run_ovs_update|default(true)
+          block:
+            - name: check if an upgrade is required
+              register: ovs_need_upgrade
+              ignore_errors: true
+              shell: |
+                yum check-upgrade openvswitch | awk '/openvswitch/{print}'
+            - name: Check openvswitch packaging.
+              shell: rpm -q --scripts openvswitch | awk '/postuninstall/,/*/' | grep -q "systemctl.*try-restart"
+              register: ovs_packaging_issue
+              ignore_errors: true
+        - name: Upgrade openvswitch
+          block:
+            - name: "Ensure empty directory: emptying."
+              file:
+                state: absent
+                path: /root/OVS_UPGRADE
+            - name: "Ensure empty directory: creating."
+              file:
+                state: directory
+                path: /root/OVS_UPGRADE
+                owner: root
+                group: root
+                mode: 0750
+            - name: Make yum cache.
+              command: yum makecache
+            - name: Download OVS packages.
+              command: yumdownloader --destdir /root/OVS_UPGRADE --resolve openvswitch
+            - name: Get rpm list for manual upgrade of OVS.
+              shell: ls -1 /root/OVS_UPGRADE/*.rpm
+              register: ovs_list_of_rpms
+            - name: Manual upgrade of OVS
+              shell: |
+                rpm -U --replacepkgs --notriggerun --nopostun {{item}}
+              args:
+                chdir: /root/OVS_UPGRADE
+              with_items:
+                - "{{ovs_list_of_rpms.stdout_lines}}"
+          when:
+            - step|int == 2
+            - run_ovs_update|default(true)
+            - ovs_packaging_issue|default(false)|succeeded
+            - ovs_need_upgrade.stdout|default('')
+        # The openvswitch package disables the systemd service on install. When installing
+        # the layered product we prevent the service from being killed, but it doesn't
+        # do anything to prevent the systemd service from being removed and it is not
+        # re-enabled by default by the new package.
+        - name: Always ensure the openvswitch service is enabled and running after upgrades
+          when: step|int == 2
+          service:
+            name: openvswitch
+            enabled: yes
+            state: started
+        - name: Check for os-net-config upgrade
+          shell: "yum check-upgrade | awk '/os-net-config/{print}'"
+          register: os_net_config_need_upgrade
+          when: step|int == 3
+        - name: Check that os-net-config has configuration
+          shell: test -s /etc/os-net-config/config.json
+          register: os_net_config_has_config
+          ignore_errors: True
+          when: step|int == 3
+        - block:
+            - name: Upgrade os-net-config
+              package: name=os-net-config state=latest
+            - name: take new os-net-config parameters into account now
+              command: os-net-config --no-activate -c /etc/os-net-config/config.json -v --detailed-exit-codes
+              register: os_net_config_upgrade
+              failed_when: os_net_config_upgrade.rc not in [0,2]
+              changed_when: os_net_config_upgrade.rc == 2
+          when:
+            - step|int == 3
+            - os_net_config_need_upgrade.stdout
+            - os_net_config_has_config.rc == 0
+        - name: Update all packages
+          when: step|int == 3
+          package: name=* state=latest
+      update_tasks:
+        - name: Check for existing yum.pid
+          stat:  path=/var/run/yum.pid
+          register: yum_pid_file
+          when: step|int == 0 or step|int == 3
+        - name: Exit if existing yum process
+          fail: msg="ERROR existing yum.pid detected - can't continue! Please ensure there is no other package update process for the duration of the minor update worfklow. Exiting."
+          when: (step|int == 0 or step|int == 3) and yum_pid_file.stat.exists
+        - name: Update all packages
+          package: name=* state=latest
+          when: step == "3"
+        # This is failsafe unless openvswitch package does something to the systemd service state.
+        - name: Ensure openvswitch is running after update
+          when: step|int == 3
+          service:
+            name: openvswitch
+            enabled: yes
+            state: started
+      fast_forward_upgrade_tasks:
+        - name: Register repo type and args
+          set_fact:
+            fast_forward_repo_type: {get_param: FastForwardRepoType}
+            fast_forward_repo_args: {get_param: FastForwardRepoArgs}
+          when: step|int == 3
+        - debug:
+            msg: "fast_forward_repo_type: {{ fast_forward_repo_type }} fast_forward_repo_args: {{ fast_forward_repo_args }}"
+          when: step|int == 3
+        - block:
+            - name: clone tripleo-repos
+              git:
+                repo: https://github.com/openstack/tripleo-repos.git
+                dest: /home/stack/tripleo-repos/
+            - name: install tripleo-repos
+              command: python setup.py install
+              args:
+                chdir: /home/stack/tripleo-repos/
+            - name: Enable tripleo-repos
+              command: "tripleo-repos {{ fast_forward_repo_args.tripleo_repos[release] }}"
+          when:
+          - step|int == 3
+          - ffu_packages_apply|bool
+          - fast_forward_repo_type == 'tripleo-repos'
+        - block:
+            - name: Create custom Script for upgrading repo.
+              copy:
+                dest: /root/ffu_update_repo.sh
+                content: {get_param: FastForwardCustomRepoScriptContent}
+                mode: 0700
+            - name: Execute custom script for upgrading repo.
+              shell: "/root/ffu_update_repo.sh {{release}}"
+          when:
+            - step|int == 3
+            - ffu_packages_apply|bool
+            - fast_forward_repo_type == 'custom-script'
+      fast_forward_post_upgrade_tasks:
+        - name: Register repo type and args
+          set_fact:
+            fast_forward_repo_type: {get_param: FastForwardRepoType}
+            fast_forward_repo_args: {get_param: FastForwardRepoArgs}
+        - debug:
+            msg: "fast_forward_repo_type: {{ fast_forward_repo_type }} fast_forward_repo_args: {{ fast_forward_repo_args }}"
+        - block:
+            - name: clone tripleo-repos
+              git:
+                repo: https://github.com/openstack/tripleo-repos.git
+                dest: /home/stack/tripleo-repos/
+            - name: install tripleo-repos
+              command: python setup.py install
+              args:
+                chdir: /home/stack/tripleo-repos/
+            - name: Enable tripleo-repos
+              command: "tripleo-repos {{ fast_forward_repo_args.tripleo_repos[release] }}"
+          when:
+          - ffu_packages_apply|bool
+          - fast_forward_repo_type == 'tripleo-repos'
+
+        - block:
+            - name: Create custom Script for upgrading repo.
+              copy:
+                dest: /root/ffu_update_repo.sh
+                content: {get_param: FastForwardCustomRepoScriptContent}
+                mode: 0700
+            - name: Execute custom script for upgrading repo.
+              shell: "/root/ffu_update_repo.sh {{release}}"
+          when:
+            - ffu_packages_apply|bool
+            - fast_forward_repo_type == 'custom-script'

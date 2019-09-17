@@ -1,0 +1,152 @@
+# FIXME: This legacy template should be converted to a composable role
+heat_template_version: rocky
+description: >
+  Software Config to drive os-net-config to configure multiple interfaces for the
+  compute role with external bridge for DVR.
+parameters:
+  ControlPlaneIp:
+    default: ''
+    description: IP address/subnet on the ctlplane network
+    type: string
+  ControlPlaneSubnetCidr:
+    default: ''
+    description: >
+      The subnet CIDR of the control plane network. (The parameter is
+      automatically resolved from the ctlplane subnet's cidr attribute.)
+    type: string
+  ControlPlaneDefaultRoute:
+    default: ''
+    description: The default route of the control plane network. (The parameter
+      is automatically resolved from the ctlplane subnet's gateway_ip attribute.)
+    type: string
+{% for network in networks %}
+  {{network.name}}IpSubnet:
+    default: ''
+    description: IP address/subnet on the {{network.name_lower}} network
+    type: string
+  {{network.name}}NetworkVlanID:
+    default: {{network.vlan|default("")}}
+    description: Vlan ID for the {{network.name_lower}} network traffic.
+    type: number
+{%- if network.ipv6|default(false) and network.gateway_ipv6|default(false) %}
+  {{network.name}}InterfaceDefaultRoute:
+    default: '{{network.gateway_ipv6}}'
+    description: default route for the {{network.name_lower}} network
+    type: string
+{%- elif network.gateway_ip|default(false) %}
+  {{network.name}}InterfaceDefaultRoute:
+    default: '{{network.gateway_ip}}'
+    description: default route for the {{network.name_lower}} network
+    type: string
+{%- endif %}
+  {{network.name}}InterfaceRoutes:
+    default: []
+    description: >
+      Routes for the {{network.name_lower}} network traffic.
+      JSON route e.g. [{'destination':'10.0.0.0/16', 'nexthop':'10.0.0.1'}]
+      Unless the default is changed, the parameter is automatically resolved
+      from the subnet host_routes attribute.
+    type: json
+{%- endfor %}
+  DnsServers: # Override this via parameter_defaults
+    default: []
+    description: >
+      DNS servers to use for the Overcloud (2 max for some implementations).
+      If not set the nameservers configured in the ctlplane subnet's
+      dns_nameservers attribute will be used.
+    type: comma_delimited_list
+  EC2MetadataIp:
+    default: ''
+    description: The IP address of the EC2 metadata server. (The parameter
+      is automatically resolved from the ctlplane subnet's host_routes attribute.)
+    type: string
+resources:
+  OsNetConfigImpl:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config:
+        str_replace:
+          template:
+            get_file: ../../scripts/run-os-net-config.sh
+          params:
+            $network_config:
+              network_config:
+              - type: interface
+                name: nic1
+                use_dhcp: false
+                dns_servers:
+                  get_param: DnsServers
+                addresses:
+                - ip_netmask:
+                    list_join:
+                    - /
+                    - - get_param: ControlPlaneIp
+                      - get_param: ControlPlaneSubnetCidr
+                routes:
+                - ip_netmask: 169.254.169.254/32
+                  next_hop:
+                    get_param: EC2MetadataIp
+                - default: true
+                  next_hop:
+                    get_param: ControlPlaneDefaultRoute
+              - type: interface
+                name: nic2
+                use_dhcp: false
+                addresses:
+                - ip_netmask:
+                    get_param: StorageIpSubnet
+                routes:
+                  get_param: StorageInterfaceRoutes
+              - type: interface
+                name: nic4
+                use_dhcp: false
+                addresses:
+                - ip_netmask:
+                    get_param: InternalApiIpSubnet
+                routes:
+                  get_param: InternalApiInterfaceRoutes
+              - type: ovs_bridge
+                name: br-tenant
+                use_dhcp: false
+                addresses:
+                - ip_netmask:
+                    get_param: TenantIpSubnet
+                routes:
+                  get_param: TenantInterfaceRoutes
+                members:
+                - type: interface
+                  name: nic5
+                  use_dhcp: false
+                  primary: true
+              # External bridge for DVR (no IP address required)
+              - type: ovs_bridge
+                name: bridge_name
+                dns_servers:
+                  get_param: DnsServers
+                use_dhcp: false
+                members:
+                - type: interface
+                  name: nic6
+                  primary: true
+            # Uncomment when including environments/network-management.yaml
+            # If setting default route on the Management interface, comment
+            # out the default route on the Control Plane.
+            #- type: interface
+            #  name: nic7
+            #  use_dhcp: false
+            #  addresses:
+            #    - ip_netmask:
+            #        get_param: ManagementIpSubnet
+            #  routes:
+            #    list_concat_unique:
+            #      - get_param: ManagementInterfaceRoutes
+            #      - - default: true
+            #          next_hop:
+            #            get_param: ManagementInterfaceDefaultRoute
+outputs:
+  OS::stack_id:
+    description: The OsNetConfigImpl resource.
+    value:
+      get_resource: OsNetConfigImpl
+

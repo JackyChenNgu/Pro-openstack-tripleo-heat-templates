@@ -1,0 +1,47 @@
+heat_template_version: rocky
+
+description: >
+  Configure TripleO Masquerade networks with Puppet.
+
+parameters:
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  MasqueradeNetworks:
+    default: {'192.168.24.0/24': ['192.168.24.0/24', '192.168.25.0/24']}
+    description: Hash of masquerade networks to manage.
+    type: json
+
+outputs:
+  role_data:
+    description: Role data for the TripleO Masquerade Networks service.
+    value:
+      service_name: masquerade_networks
+      config_settings:
+        masquerade_networks: {get_param: MasqueradeNetworks}
+      step_config: |
+        include tripleo::masquerade_networks
+      upgrade_tasks: []

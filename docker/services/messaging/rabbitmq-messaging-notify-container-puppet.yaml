@@ -1,0 +1,321 @@
+heat_template_version: rocky
+
+description: >
+  OpenStack containerized Rabbitmq service
+
+parameters:
+  DockerRabbitmqImage:
+    description: image
+    type: string
+  DockerRabbitmqConfigImage:
+    description: The container image to use for the rabbitmq config_volume
+    type: string
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  RabbitCookie:
+    type: string
+    default: ''
+    hidden: true
+  EnableInternalTLS:
+    type: boolean
+    default: false
+  InternalTLSCAFile:
+    default: '/etc/ipa/ca.crt'
+    type: string
+    description: Specifies the default CA cert to use if TLS is used for
+                 services in the internal network.
+  NotifyPort:
+    default: 5672
+    description: The network port for messaging Notify backend
+    type: number
+  NotifyUserName:
+    default: guest
+    description: The username for messaging Notifications
+    type: string
+  NotifyPassword:
+    description: The password for messaging Notifications
+    type: string
+    hidden: true
+  NotifyUseSSL:
+    default: false
+    description: Messaging Notification client subscriber parameter to specify
+                 an SSL connection to the messaging host.
+    type: string
+
+conditions:
+  internal_tls_enabled: {equals: [{get_param: EnableInternalTLS}, true]}
+
+resources:
+
+  ContainersCommon:
+    type: ../containers-common.yaml
+
+  RabbitMQServiceBase:
+    type: ./rabbitmq-container-puppet.yaml
+    properties:
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      EndpointMap: {get_param: EndpointMap}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+outputs:
+  role_data:
+    description: Role data for the Rabbitmq API role.
+    value:
+      service_name: oslo_messaging_notify
+      monitoring_subscription: {get_attr: [RabbitMQServiceBase, role_data, monitoring_subscription]}
+      # RabbitMQ plugins initialization occurs on every node
+      global_config_settings:
+        map_merge:
+          - get_attr: [RabbitMQServiceBase, role_data, global_config_settings]
+          - oslo_messaging_notify_scheme: rabbit
+            oslo_messaging_notify_user_name: {get_param: NotifyUserName}
+            oslo_messaging_notify_password: {get_param: NotifyPassword}
+            oslo_messaging_notify_use_ssl: {get_param: NotifyUseSSL}
+            oslo_messaging_notify_port: {get_param: NotifyPort}
+      config_settings:
+        map_merge:
+          - get_attr: [RabbitMQServiceBase, role_data, config_settings]
+          - rabbitmq::default_user: {get_param: NotifyUserName}
+            rabbitmq::default_pass: {get_param: NotifyPassword}
+            tripleo::oslo_messaging_notify::firewall_rules:
+              '109 rabbitmq':
+                dport:
+                  - 4369
+                  - {get_param: NotifyPort}
+                  - 25672
+            rabbitmq::port: {get_param: NotifyPort}
+            rabbitmq::interface:
+              str_replace:
+                template:
+                  "%{hiera('$NETWORK')}"
+                params:
+                  $NETWORK: {get_param: [ServiceNetMap, OsloMessagingNotifyNetwork]}
+            rabbitmq::ssl: {get_param: EnableInternalTLS}
+            rabbitmq::ssl_erl_dist: {get_param: EnableInternalTLS}
+            rabbitmq::ssl_port: {get_param: NotifyPort}
+            rabbitmq::ssl_only: {get_param: EnableInternalTLS}
+            rabbitmq::ssl_interface:
+              str_replace:
+                template:
+                  "%{hiera('$NETWORK')}"
+                params:
+                  $NETWORK: {get_param: [ServiceNetMap, OsloMessagingNotifyNetwork]}
+            tripleo::profile::base::rabbitmq::enable_internal_tls: {get_param: EnableInternalTLS}
+            rabbitmq::collect_statistics_interval: 30000
+            rabbitmq::admin_enable: false
+            rabbitmq::management_enable: true
+            rabbitmq::use_config_file_for_plugins: true
+            rabbitmq::management_ip_address: 127.0.0.1
+            rabbitmq::config_management_variables:
+              rates_mode: none
+          -
+            if:
+            - internal_tls_enabled
+            - generate_service_certificates: true
+              tripleo::rabbitmq::service_certificate: '/etc/pki/tls/certs/rabbitmq.crt'
+              tripleo::certmonger::rabbitmq::postsave_cmd: "true" # TODO: restart the rabbitmq container here
+              tripleo::profile::base::rabbitmq::certificate_specs:
+                service_certificate: '/etc/pki/tls/certs/rabbitmq.crt'
+                service_key: '/etc/pki/tls/private/rabbitmq.key'
+                hostname:
+                  str_replace:
+                    template: "%{hiera('fqdn_NETWORK')}"
+                    params:
+                      NETWORK: {get_param: [ServiceNetMap, OsloMessagingNotifyNetwork]}
+                principal:
+                  str_replace:
+                    template: "rabbitmq/%{hiera('fqdn_NETWORK')}"
+                    params:
+                      NETWORK: {get_param: [ServiceNetMap, OsloMessagingNotifyNetwork]}
+                postsave_cmd: "/usr/bin/certmonger-rabbitmq-refresh.sh"
+            - {}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: rabbitmq
+        step_config:
+          list_join:
+            - "\n"
+            - - "['Rabbitmq_policy', 'Rabbitmq_user'].each |String $val| { noop_resource($val) }"
+              - "include ::tripleo::profile::base::rabbitmq"
+        config_image: &rabbitmq_config_image {get_param: DockerRabbitmqConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/rabbitmq.json:
+          command: /usr/lib/rabbitmq/bin/rabbitmq-server
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+            - source: "/var/lib/kolla/config_files/src-tls/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+              optional: true
+          permissions:
+            - path: /var/lib/rabbitmq
+              owner: rabbitmq:rabbitmq
+              recurse: true
+            - path: /etc/pki/tls/certs/rabbitmq.crt
+              owner: rabbitmq:rabbitmq
+              optional: true
+            - path: /etc/pki/tls/private/rabbitmq.key
+              owner: rabbitmq:rabbitmq
+              optional: true
+      docker_config:
+        # Kolla_bootstrap runs before permissions set by kolla_config
+        step_1:
+          rabbitmq_init_logs:
+            start_order: 0
+            detach: false
+            image: &rabbitmq_image {get_param: DockerRabbitmqImage}
+            net: none
+            privileged: false
+            user: root
+            volumes:
+              - /var/log/containers/rabbitmq:/var/log/rabbitmq:z
+            command: ['/bin/bash', '-c', 'chown -R rabbitmq:rabbitmq /var/log/rabbitmq']
+          rabbitmq_bootstrap:
+            start_order: 1
+            detach: false
+            image: *rabbitmq_image
+            net: host
+            privileged: false
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/kolla/config_files/rabbitmq.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/rabbitmq/:/var/lib/kolla/config_files/src:ro
+                  - /var/lib/rabbitmq:/var/lib/rabbitmq:z
+                  - /var/log/containers/rabbitmq:/var/log/rabbitmq:z
+                - if:
+                  - internal_tls_enabled
+                  -
+                    - list_join:
+                      - ':'
+                      - - {get_param: InternalTLSCAFile}
+                        - {get_param: InternalTLSCAFile}
+                        - 'ro'
+                    - /etc/pki/tls/certs/rabbitmq.crt:/var/lib/kolla/config_files/src-tls/etc/pki/tls/certs/rabbitmq.crt:ro
+                    - /etc/pki/tls/private/rabbitmq.key:/var/lib/kolla/config_files/src-tls/etc/pki/tls/private/rabbitmq.key:ro
+                  - null
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+              - KOLLA_BOOTSTRAP=True
+              -
+                list_join:
+                  - '='
+                  - - 'RABBITMQ_CLUSTER_COOKIE'
+                    -
+                      yaql:
+                        expression: $.data.passwords.where($ != '').first()
+                        data:
+                          passwords:
+                            - {get_param: RabbitCookie}
+                            - {get_param: [DefaultPasswords, rabbit_cookie]}
+          rabbitmq:
+            start_order: 2
+            stop_grace_period: 60
+            image: *rabbitmq_image
+            net: host
+            privileged: false
+            restart: always
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/kolla/config_files/rabbitmq.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/rabbitmq/:/var/lib/kolla/config_files/src:ro
+                  - /var/lib/rabbitmq:/var/lib/rabbitmq:z
+                  - /var/log/containers/rabbitmq:/var/log/rabbitmq:z
+                - if:
+                  - internal_tls_enabled
+                  -
+                    - list_join:
+                      - ':'
+                      - - {get_param: InternalTLSCAFile}
+                        - {get_param: InternalTLSCAFile}
+                        - 'ro'
+                    - /etc/pki/tls/certs/rabbitmq.crt:/var/lib/kolla/config_files/src-tls/etc/pki/tls/certs/rabbitmq.crt:ro
+                    - /etc/pki/tls/private/rabbitmq.key:/var/lib/kolla/config_files/src-tls/etc/pki/tls/private/rabbitmq.key:ro
+                  - null
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      container_puppet_tasks:
+        # RabbitMQ users and policies initialization occurs only on single node
+        step_2:
+          config_volume: 'rabbit_init_tasks'
+          puppet_tags: 'rabbitmq_policy,rabbitmq_user'
+          step_config: 'include ::tripleo::profile::base::rabbitmq'
+          config_image: *rabbitmq_config_image
+          volumes:
+            - /var/lib/config-data/rabbitmq/etc/rabbitmq/:/etc/rabbitmq/:ro
+            - /var/lib/rabbitmq:/var/lib/rabbitmq:z
+      metadata_settings:
+        if:
+          - internal_tls_enabled
+          -
+            - service: rabbitmq
+              network: {get_param: [ServiceNetMap, OsloMessagingNotifyNetwork]}
+              type: node
+          - null
+      host_prep_tasks:
+        - name: create persistent directories
+          file:
+            path: "{{ item.path }}"
+            state: directory
+            setype: "{{ item.setype }}"
+          with_items:
+            - { 'path': /var/log/containers/rabbitmq, 'setype': svirt_sandbox_file_t }
+            - { 'path': /var/lib/rabbitmq, 'setype': svirt_sandbox_file_t }
+            - { 'path': /var/log/rabbitmq, 'setype': svirt_sandbox_file_t }
+        - name: rabbitmq logs readme
+          copy:
+            dest: /var/log/rabbitmq/readme.txt
+            content: |
+              Log files from rabbitmq containers can be found under
+              /var/log/containers/rabbitmq.
+          ignore_errors: true
+      upgrade_tasks: []
+      update_tasks:
+        # TODO: Are we sure we want to support this.  Rolling update
+        # without pacemaker may fail.  Do we test this ?  In any case,
+        # this is under paunch control so the latest image should be
+        # pulled in by the deploy steps.  Same question for other
+        # usually managed by pacemaker container.
+      post_upgrade_tasks:
+        - when: step|int == 1
+          import_role:
+            name: tripleo-docker-rm
+          vars:
+            containers_to_rm:
+              - rabbitmq

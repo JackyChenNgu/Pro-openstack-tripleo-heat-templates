@@ -1,0 +1,352 @@
+heat_template_version: rocky
+
+description: >
+  OpenStack containerized Cinder API service
+
+parameters:
+  DockerCinderApiImage:
+    description: image
+    type: string
+  DockerCinderConfigImage:
+    description: The container image to use for the cinder config_volume
+    type: string
+  CinderApiLoggingSource:
+    type: json
+    default:
+      tag: openstack.cinder.api
+      path: /var/log/containers/cinder/cinder-api.log
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EnableInternalTLS:
+    type: boolean
+    default: false
+  UpgradeRemoveUnusedPackages:
+    default: false
+    description: Remove package if the service is being disabled during upgrade
+    type: boolean
+
+conditions:
+
+  internal_tls_enabled: {equals: [{get_param: EnableInternalTLS}, true]}
+
+resources:
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  MySQLClient:
+    type: ../../puppet/services/database/mysql-client.yaml
+
+  CinderBase:
+    type: ../../puppet/services/cinder-api.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+outputs:
+  role_data:
+    description: Role data for the Cinder API role.
+    value:
+      service_name: {get_attr: [CinderBase, role_data, service_name]}
+      config_settings: {get_attr: [CinderBase, role_data, config_settings]}
+      logging_source: {get_attr: [CinderBase, role_data, logging_source]}
+      logging_groups: {get_attr: [CinderBase, role_data, logging_groups]}
+      service_config_settings:
+        map_merge:
+          - get_attr: [CinderBase, role_data, service_config_settings]
+          - fluentd:
+              tripleo_fluentd_groups_cinder_api:
+                - cinder
+              tripleo_fluentd_sources_cinder_api:
+                - {get_param: CinderApiLoggingSource}
+      # BEGIN DOCKER SETTINGS
+      puppet_config:
+        config_volume: cinder
+        puppet_tags: cinder_config,cinder_type,file,concat,file_line
+        step_config:
+          list_join:
+            - "\n"
+            - - {get_attr: [CinderBase, role_data, step_config]}
+              - {get_attr: [MySQLClient, role_data, step_config]}
+        config_image: {get_param: DockerCinderConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/cinder_api.json:
+          command: /usr/sbin/httpd -DFOREGROUND
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/cinder
+              owner: cinder:cinder
+              recurse: true
+        /var/lib/kolla/config_files/cinder_api_cron.json:
+          command: /usr/sbin/crond -n
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/cinder
+              owner: cinder:cinder
+              recurse: true
+      docker_config:
+        step_2:
+          cinder_api_init_logs:
+            image: &cinder_api_image {get_param: DockerCinderApiImage}
+            privileged: false
+            user: root
+            volumes:
+              - /var/log/containers/cinder:/var/log/cinder
+              - /var/log/containers/httpd/cinder-api:/var/log/httpd
+            command: ['/bin/bash', '-c', 'chown -R cinder:cinder /var/log/cinder']
+        step_3:
+          cinder_api_db_sync:
+            image: *cinder_api_image
+            net: host
+            privileged: false
+            detach: false
+            user: root
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/config-data/cinder/etc/my.cnf.d/tripleo.cnf:/etc/my.cnf.d/tripleo.cnf:ro
+                  - /var/lib/config-data/cinder/etc/cinder/:/etc/cinder/:ro
+                  - /var/log/containers/cinder:/var/log/cinder
+                  - /var/log/containers/httpd/cinder-api:/var/log/httpd
+            command:
+              - '/usr/bin/bootstrap_host_exec'
+              - 'cinder_api'
+              - "su cinder -s /bin/bash -c 'cinder-manage db sync --bump-versions'"
+        step_4:
+          cinder_api:
+            image: *cinder_api_image
+            net: host
+            privileged: false
+            restart: always
+            # NOTE(mandre) kolla image changes the user to 'cinder', we need it
+            # to be root to run httpd
+            user: root
+            healthcheck:
+              test: /openstack/healthcheck
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/kolla/config_files/cinder_api.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/cinder/:/var/lib/kolla/config_files/src:ro
+                  - /var/log/containers/cinder:/var/log/cinder
+                  - /var/log/containers/httpd/cinder-api:/var/log/httpd
+                  -
+                    if:
+                      - internal_tls_enabled
+                      - /etc/pki/tls/certs/httpd:/etc/pki/tls/certs/httpd:ro
+                      - ''
+                  -
+                    if:
+                      - internal_tls_enabled
+                      - /etc/pki/tls/private/httpd:/etc/pki/tls/private/httpd:ro
+                      - ''
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+          cinder_api_cron:
+            image: *cinder_api_image
+            net: host
+            user: root
+            privileged: false
+            restart: always
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                -
+                  - /var/lib/kolla/config_files/cinder_api_cron.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/cinder/:/var/lib/kolla/config_files/src:ro
+                  - /var/log/containers/cinder:/var/log/cinder
+                  - /var/log/containers/httpd/cinder-api:/var/log/httpd
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      docker_puppet_tasks:
+        # Create the default volume type after the cinder-api service is
+        # running. The puppet code will ensure this is only done once, on
+        # the bootstrap node.
+        step_4:
+          config_volume: 'cinder_init_tasks'
+          puppet_tags: cinder_config,cinder_type,file,concat,file_line
+          step_config: 'include ::tripleo::profile::base::cinder::api'
+          config_image: *cinder_api_image
+          volumes:
+            - /var/lib/config-data/cinder/etc/cinder/:/etc/cinder/:ro
+
+      metadata_settings:
+        get_attr: [CinderBase, role_data, metadata_settings]
+      host_prep_tasks:
+        - name: create persistent directories
+          file:
+            path: "{{ item.path }}"
+            state: directory
+            setype: "{{ item.setype }}"
+          with_items:
+            - { 'path': /var/log/containers/cinder, 'setype': svirt_sandbox_file_t }
+            - { 'path': /var/log/containers/httpd/cinder-api, 'setype': svirt_sandbox_file_t }
+            - { 'path': /var/log/cinder, 'setype': svirt_sandbox_file_t }
+        - name: cinder logs readme
+          copy:
+            dest: /var/log/cinder/readme.txt
+            content: |
+              Log files from cinder containers can be found under
+              /var/log/containers/cinder and /var/log/containers/httpd/cinder-api.
+          ignore_errors: true
+      upgrade_tasks:
+        - when: step|int == 0
+          tags: common
+          block:
+            - name: get bootstrap nodeid
+              command: hiera -c /etc/puppet/hiera.yaml bootstrap_nodeid
+              register: bootstrap_node
+            - name: set is_bootstrap_node fact
+              set_fact: is_bootstrap_node={{bootstrap_node.stdout|lower == ansible_hostname|lower}}
+            - name: Check is cinder_api is deployed
+              command: systemctl is-enabled openstack-cinder-api
+              ignore_errors: True
+              register: cinder_api_enabled_result
+            - name: Set fact cinder_api_enabled
+              set_fact:
+                cinder_api_enabled: "{{ cinder_api_enabled_result.rc == 0 }}"
+            - name: Check if httpd service is running
+              command: systemctl is-active --quiet httpd
+              ignore_errors: True
+              register: httpd_running_result
+              when: httpd_running is undefined
+            - name: Set fact httpd_running
+              set_fact:
+                httpd_running: "{{ httpd_running_result.rc == 0 }}"
+              when: httpd_running is undefined
+            - name: check for cinder_api running under apache (post upgrade)
+              shell: "httpd -t -D DUMP_VHOSTS | grep -q cinder"
+              register: cinder_api_apache
+              ignore_errors: true
+            - name: Set fact cinder_api_apache (upgrade)
+              set_fact:
+                cinder_api_apache: "{{ cinder_api_apache.rc == 0 }}"
+            - name: "PreUpgrade step0,validation: Check service openstack-cinder-api is running"
+              shell: systemctl is-active --quiet openstack-cinder-api
+              when: cinder_api_enabled|bool
+              tags: validation
+            - name: Ensure all online data migrations for Cinder have been applied
+              shell: |
+                if docker ps | grep cinder_api; then
+                  docker exec cinder_api cinder-manage db online_data_migrations
+                fi
+              tags: pre-upgrade
+              when:
+                - is_bootstrap_node|bool
+                - not (cinder_api_apache|bool and httpd_running|bool)
+                - not cinder_api_enabled|bool
+        - when: step|int == 2
+          block:
+            - name: Stop and disable cinder_api service (pre-upgrade not under httpd)
+              service: name=openstack-cinder-api state=stopped enabled=no
+              when: cinder_api_enabled|bool
+            - name: Stop and disable cinder_api service
+              service: name=httpd state=stopped enabled=no
+              when: cinder_api_apache|bool
+        - when: step|int == 3
+          block:
+            - name: remove old cinder cron jobs
+              file:
+                path: /var/spool/cron/cinder
+                state: absent
+            - name: Set fact for removal of httpd package
+              set_fact:
+                remove_httpd_package: {get_param: UpgradeRemoveUnusedPackages}
+            - name: Remove httpd package if operator requests it
+              package: name=httpd state=removed
+              ignore_errors: True
+              when: remove_httpd_package|bool
+      external_upgrade_tasks:
+        - when: step|int == 1
+          block:
+            - name: Online data migration for Cinder
+              command: docker exec cinder_api cinder-manage db online_data_migrations
+              delegate_to: "{{ groups['cinder_api'][0] }}"
+              become: true
+              tags:
+                - online_upgrade
+                - online_upgrade_cinder
+      fast_forward_upgrade_tasks:
+        - when:
+            - step|int == 0
+            - release == 'ocata'
+          block:
+            - name: Check is cinder_api is deployed
+              command: systemctl is-enabled --quiet openstack-cinder-api
+              ignore_errors: True
+              register: cinder_api_enabled_result
+            - name: Set fact cinder_api_enabled
+              set_fact:
+                cinder_api_enabled: "{{ cinder_api_enabled_result.rc == 0 }}"
+        - name: Stop openstack-cinder-api
+          service: name=openstack-cinder-api state=stopped
+          when:
+            - step|int == 1
+            - release == 'ocata'
+            - cinder_api_enabled|bool
+        - name: Extra removal of services for cinder
+          shell: |
+            cinder-manage service list |\
+            grep -v Binary | tr '@' ' ' |\
+            awk '{print $1 " " $2}' |\
+            while read i ; do cinder-manage service remove $i ; done
+          when:
+            - step|int == 5
+            - release == 'pike'
+            - is_bootstrap_node|bool
+        - name: Extra migration for cinder
+          command: cinder-manage db online_data_migrations
+          when:
+            - step|int == 5
+            - release == 'pike'
+            - is_bootstrap_node|bool
+        - name: Cinder package update
+          package:
+            name: 'openstack-cinder*'
+            state: latest
+          when:
+            - step|int == 6
+            - is_bootstrap_node|bool
+        - name: Cinder db sync
+          command: cinder-manage db sync
+          when:
+            - step|int == 8
+            - is_bootstrap_node|bool

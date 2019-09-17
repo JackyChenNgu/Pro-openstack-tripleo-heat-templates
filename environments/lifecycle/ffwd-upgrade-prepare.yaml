@@ -1,0 +1,12 @@
+# Environment file used in the first step of a ffwd overcloud upgrade.
+# This file is required by the tripleoclient and not expected to be updated
+# by the operator. Please use additional -e env.yaml.
+resource_registry:
+  OS::TripleO::Services::Core: OS::Heat::None
+  OS::TripleO::Services::VipHosts: OS::Heat::None
+  # Deprecated/Name changed services
+  OS::TripleO::Services::FluentdClient: OS::Heat::None
+
+parameter_defaults:
+  StackUpdateType: FASTFORWARDUPGRADE
+  NetworkDeploymentActions: ['CREATE','UPDATE']
